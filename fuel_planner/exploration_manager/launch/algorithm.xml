@@ -10,7 +10,6 @@
     - FrontierFinder             : frontier/FIS 增量维护
     - FastPlannerManager         : 几何路径 / kino A* / B-spline 优化 / yaw 规划
     - SDFMap + MapROS + EDTEnvironment : 占据地图与 ESDF
-222222
     论文里的三层规划大致对应这里的参数分组：
     - frontier/* + exploration/* : Incremental Frontier Structure + global/local exploration
     - manager/* + search/* + astar/* : 路径搜索层
