@@ -1,23 +1,87 @@
 <launch>
-  <!-- size of map, change the size in x, y, z according to your application -->
+  <!--
+    FUEL 单机探索 demo 的顶层 launch。
+
+    这一层主要负责“接线”而不是实现算法，核心作用是：
+    1. 给 exploration_node 传入地图 / 传感器 / 动力学约束参数
+    2. 启动 traj_server，把规划得到的 B-spline 变成连续位置指令
+    3. 启动 waypoint_generator，把 RViz 的 2D Nav Goal 转成“开始探索”触发消息
+    4. 启动仿真器、控制器和深度传感器模拟
+
+    默认 demo 的主闭环是：
+    RViz /move_base_simple/goal
+      -> waypoint_generator /waypoint_generator/waypoints
+      -> exploration_node 生成 /planning/bspline
+      -> traj_server 生成 /planning/pos_cmd
+      -> so3_control / quadrotor_simulator 执行
+      -> pcl_render_node 发布深度图和相机位姿
+      -> exploration_node 更新地图并重规划
+  -->
+
+  <!-- 地图大小（单位 m）。
+       这里是整个体素地图 / 传感器渲染地图的尺寸，不是“已允许探索区域”的边界。
+       真正允许统计探索进度、检测 frontier 的 box 边界在下方 algorithm.xml include 中单独传入。 -->
   <arg name="map_size_x" value="50.0"/>
   <arg name="map_size_y" value="50.0"/>
   <arg name="map_size_z" value=" 10.0"/>
 
+  <!-- 无人机初始位置（world 系）。同时会被：
+       1) simulator.xml 里的动力学仿真器用作初始状态
+       2) traj_server 用作启动阶段的悬停 / 抬升初始点 -->
   <arg name="init_x" value="0"/>
   <arg name="init_y" value="0"/>
   <arg name="init_z" value="1.0"/> 
 
-  <!-- topic of your odometry such as VIO or LIO -->
+  <!--
+    统一的里程计接口。
+    exploration.launch 把整个系统都接到这一条 odom 上，便于以后替换成真实机上的 VIO / LIO / EKF。
+
+    在默认仿真里，这个话题通常来自：
+    quadrotor_simulator_so3 -> /visual_slam/odom
+      -> so3_disturbance_generator -> /state_ukf/odom
+
+    这条 odom 会同时喂给：
+    - exploration_node：读取当前位置、速度、姿态，作为规划起点
+    - traj_server：做轨迹执行、碰撞前瞻检查、轨迹可视化
+    - waypoint_generator：仅用于生成触发 path 时附带当前位姿参考
+    - pcl_render_node：根据当前机体位姿渲染深度图
+  -->
   <arg name="odom_topic" value="/state_ukf/odom" />
 
-  <!-- main algorithm params -->
+  <!--
+    主算法节点 exploration_node。
+
+    这个 include 实际启动的是 exploration_manager/launch/algorithm.xml，其中核心节点是：
+    - exploration_node
+
+    它对外的关键接口是：
+    输入：
+    - /odom_world      : nav_msgs/Odometry，当前机体状态
+    - /map_ros/pose    : geometry_msgs/PoseStamped，深度相机在 world 中的位姿
+    - /map_ros/depth   : sensor_msgs/Image，深度图
+    - /map_ros/cloud   : sensor_msgs/PointCloud2，点云输入（深度图 / 点云二选一）
+
+    输出：
+    - /planning/bspline : bspline::Bspline，位置和 yaw 的 B-spline 轨迹
+    - /planning/replan  : std_msgs/Empty，通知 traj_server 截断旧轨迹
+    - /planning/new     : std_msgs/Empty，通知 traj_server 清空旧显示
+    - /planning_vis/*   : frontier / 轨迹 / 视点等 RViz 可视化
+
+    这一层传入的主要是三类东西：
+    - 地图尺寸与有效探索边界
+    - 传感器接口和相机内参
+    - 速度 / 加速度上限
+  -->
   <include file="$(find exploration_manager)/launch/algorithm.xml">
 
     <arg name="map_size_x_" value="$(arg map_size_x)"/>
     <arg name="map_size_y_" value="$(arg map_size_y)"/>
     <arg name="map_size_z_" value="$(arg map_size_z)"/>
 
+    <!--
+      真正用于探索统计、frontier 搜索、地图可视化截断的有效工作包围盒。
+      这里通常应当与实际环境尺寸接近，而不一定等于整个 map_size。
+    -->
     <arg name="box_min_x" value="-10.0"/>
     <arg name="box_min_y" value="-15.0"/>
     <arg name="box_min_z" value=" 0.0"/>
@@ -25,37 +89,91 @@
     <arg name="box_max_y" value="15.0"/>
     <arg name="box_max_z" value=" 2.0"/>
 
+    <!-- exploration_node 内部统一使用 /odom_world 作为 odom 名字，
+         这里把它接到上面的 odom_topic。 -->
     <arg name="odometry_topic" value="$(arg odom_topic)"/>
-    <!-- sensor pose: transform of camera frame in the world frame -->
+
+    <!--
+      深度相机位姿接口。
+      上游来自 pcl_render_node 发布的 /pcl_render_node/sensor_pose。
+      数据类型：geometry_msgs/PoseStamped
+      含义：当前相机光心 / 相机坐标系在 world 中的位姿。
+      用途：MapROS 会把它和深度图 / 点云同步，用来把观测投影回世界坐标系。
+    -->
     <arg name="sensor_pose_topic" value="/pcl_render_node/sensor_pose"/>
-    <!-- depth topic: depth image, 640x480 by default -->
-    <!-- cloud topic: point cloud measurement  -->
-    <!-- subscribe ONLY TO ONE of the two topics -->
+
+    <!--
+      深度输入接口。
+      默认上游是 pcl_render_node 发布的 /pcl_render_node/depth。
+      数据类型：sensor_msgs/Image，默认 640x480 深度图。
+      用途：作为在线建图输入，经 MapROS -> SDFMap 融合成 occupancy / ESDF。
+    -->
     <arg name="depth_topic" value="/pcl_render_node/depth"/>
+
+    <!--
+      点云输入接口。
+      exploration_node 也支持直接订阅点云，但默认 office demo 主要走 depth_topic 分支。
+      数据类型：sensor_msgs/PointCloud2
+      说明：depth 和 cloud 在配置上是“二选一”的输入来源；默认仿真里 cloud 通常不用。
+    -->
     <arg name="cloud_topic" value="/pcl_render_node/cloud"/>
 
-    <!-- intrinsic params of the depth camera -->
+    <!-- 深度相机内参，供 MapROS 把深度图反投影为 3D 点。 -->
     <arg name="cx" value="321.04638671875"/>
     <arg name="cy" value="243.44969177246094"/>
     <arg name="fx" value="387.229248046875"/>
     <arg name="fy" value="387.229248046875"/>
 
-    <!-- maximum velocity and acceleration the drone will reach -->
+    <!-- 动力学硬约束：
+         exploration_node 会把它继续下传给搜索器、B-spline 优化器、yaw 规划器。 -->
     <arg name="max_vel" value="2.0" />
     <arg name="max_acc" value="2.0" />
   </include>
 
-  <!-- trajectory server -->
+  <!--
+    轨迹服务器 traj_server。
+
+    它不是“规划器”，而是“轨迹执行接口层”：
+    - 订阅 exploration_node 输出的 /planning/bspline
+    - 按当前 ROS 时间采样位置 / 速度 / 加速度 / yaw
+    - 发布给控制器的位置指令 /planning/pos_cmd
+    - 同时发布 FoV 和执行轨迹可视化
+
+    关键输入：
+    - planning/bspline : bspline::Bspline
+    - planning/replan  : std_msgs/Empty
+    - planning/new     : std_msgs/Empty
+    - /odom_world      : nav_msgs/Odometry
+
+    关键输出：
+    - /position_cmd（这里 remap 成 planning/pos_cmd）: quadrotor_msgs/PositionCommand
+    - planning/travel_traj                           : 已执行参考轨迹可视化
+    - planning/position_cmd_vis                      : 当前 FoV / 指令可视化
+  -->
   <node pkg="plan_manage" name="traj_server" type="traj_server" output="screen">
+    <!--
+      traj_server 源码内部发布的是 /position_cmd。
+      这里统一 remap 到 planning/pos_cmd，作为“规划器到控制器”的标准接口。
+      下游消费者：simulator.xml 里的 so3_control 节点。
+      数据类型：quadrotor_msgs/PositionCommand
+      含义：期望位置、速度、加速度、yaw、yaw_dot。
+    -->
     <remap from="/position_cmd" to="planning/pos_cmd"/>
 
+    <!-- traj_server 内部统一把机体状态接口写成 /odom_world，这里接到系统公共 odom。 -->
     <remap from="/odom_world" to="$(arg odom_topic)"/>
+
+    <!-- 轨迹服务器自己的执行 / 可视化参数。 -->
     <param name="traj_server/time_forward" value="1.5" type="double"/>
     <param name="traj_server/pub_traj_id" value="4" type="int"/>
     <param name="traj_server/init_x" value="$(arg init_x)" type="double"/>
     <param name="traj_server/init_y" value="$(arg init_y)" type="double"/>
     <param name="traj_server/init_z" value="$(arg init_z)" type="double"/>
 
+    <!--
+      perception_utils 参数在 traj_server 中只用于“当前命令位姿的 FoV 可视化”，
+      不参与 frontier 选择本身；frontier 选择那边会在 algorithm.xml 里再配一份同名参数。
+    -->
     <param name="perception_utils/top_angle" value="0.56125" type="double"/>
     <param name="perception_utils/left_angle" value="0.69222" type="double"/>
     <param name="perception_utils/right_angle" value="0.68901" type="double"/>
@@ -65,14 +183,62 @@
 
   </node>
 
+  <!--
+    waypoint_generator 是“人机交互接口层”。
+
+    默认 office 探索 demo 中，它的作用不是把 RViz 点击位置直接作为飞行目标，
+    而是把 2D Nav Goal 转成一条 nav_msgs/Path，然后由 exploration_node 把这条 path 当成“开始探索”的触发信号。
+
+    关键输入：
+    - ~odom  : nav_msgs/Odometry，当前机体位姿
+    - ~goal  : geometry_msgs/PoseStamped，来自 RViz 的 /move_base_simple/goal
+    - ~traj_start_trigger : geometry_msgs/PoseStamped，备用触发接口
+
+    关键输出：
+    - ~waypoints（实际全局名为 /waypoint_generator/waypoints）: nav_msgs/Path
+
+    注意：
+    - 这里 waypoint_type=point，会调用 sample_waypoints.h 里的 point() 生成固定 path
+    - FastExplorationFSM::triggerCallback() 实际只检查消息有效性，然后切换到 PLAN_TRAJ
+    - 所以在这个 demo 里，2D Nav Goal 更像“启动按钮”，不是“指定探索终点”
+  -->
   <node pkg="waypoint_generator" name="waypoint_generator" type="waypoint_generator" output="screen">
+    <!-- waypoint_generator 内部订阅 ~odom，用来给生成的 Path 附带当前参考姿态。 -->
     <remap from="~odom" to="$(arg odom_topic)"/>        
+
+    <!--
+      对接 RViz 的 2D Nav Goal 工具。
+      上游：RViz 发布 /move_base_simple/goal
+      数据类型：geometry_msgs/PoseStamped
+    -->
     <remap from="~goal" to="/move_base_simple/goal"/>
+
+    <!-- 备用触发接口；当前 demo 通常不用。 -->
     <remap from="~traj_start_trigger" to="/traj_start_trigger" />
+
+    <!-- 默认用固定 point() path 作为触发消息载体。 -->
     <param name="waypoint_type" value="point"/>    
   </node>
 
-  <!-- use simulator -->
+  <!--
+    仿真与传感器栈。
+
+    这个 include 会启动：
+    - map_pub                  : 发布 office.pcd 对应的全局点云
+    - quadrotor_simulator_so3  : 动力学仿真
+    - so3_control              : 控制器，把 planning/pos_cmd 变成 so3_cmd
+    - so3_disturbance_generator: 给 odom 加扰动 / 估计误差
+    - odom_visualization       : 仅 RViz 可视化
+    - pcl_render_node          : 根据全局点云和当前位姿渲染深度图
+
+    对 exploration_node 最重要的上游接口是：
+    - /state_ukf/odom                : 统一 odom
+    - /pcl_render_node/depth         : 深度图
+    - /pcl_render_node/sensor_pose   : 相机位姿
+
+    对控制链最重要的下游接口是：
+    - /planning/pos_cmd -> so3_control -> so3_cmd -> quadrotor_simulator_so3
+  -->
   <include file="$(find exploration_manager)/launch/simulator.xml">
     <arg name="map_size_x_" value="$(arg map_size_x)"/>
     <arg name="map_size_y_" value="$(arg map_size_y)"/>
@@ -82,7 +248,12 @@
     <arg name="init_y" value="$(arg init_y)"/>
     <arg name="init_z" value="$(arg init_z)"/>
 
+    <!-- simulator.xml 内部会把 ~odometry remap 到这条 odom。
+         默认就是 /state_ukf/odom，真实机上也可以替换成外部状态估计。 -->
     <arg name="odometry_topic" value="$(arg odom_topic)" />
+
+    <!-- 这两个参数在当前 office.pcd 路径下基本属于兼容保留参数，
+         主要对另一套随机地图生成逻辑更有意义。 -->
     <arg name="c_num" value="0"/>
     <arg name="p_num" value="130"/>
   </include>
