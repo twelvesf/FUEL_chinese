@@ -1,8 +1,32 @@
 <launch>
+  <!--
+    exploration_node 的参数与接口总表。
+
+    这个 launch 不负责起整套系统，只负责启动主算法节点 exploration_node，并把外部接口 remap 成算法内部统一使用的名字。
+
+    从代码结构看，exploration_node 内部最终会初始化：
+    - FastExplorationFSM         : 探索状态机
+    - FastExplorationManager     : 全局 tour + 局部 viewpoint refinement
+    - FrontierFinder             : frontier/FIS 增量维护
+    - FastPlannerManager         : 几何路径 / kino A* / B-spline 优化 / yaw 规划
+    - SDFMap + MapROS + EDTEnvironment : 占据地图与 ESDF
+
+    论文里的三层规划大致对应这里的参数分组：
+    - frontier/* + exploration/* : Incremental Frontier Structure + global/local exploration
+    - manager/* + search/* + astar/* : 路径搜索层
+    - optimization/* + bspline/* + heading_planner/* : 轨迹 / yaw 优化层
+  -->
+
+  <!-- 从外层 exploration.launch 传入的地图尺寸。 -->
   <arg name="map_size_x_"/>
   <arg name="map_size_y_"/>
   <arg name="map_size_z_"/>
 
+  <!-- 有效探索工作空间包围盒。
+       这组边界会写进 sdf_map/box_*，后续很多模块都用它裁剪有效区域：
+       - frontier 检测
+       - occupancy / ESDF 可视化
+       - 视点采样和碰撞检查 -->
   <arg name="box_min_x"/>
   <arg name="box_min_y"/>
   <arg name="box_min_z"/>
@@ -10,47 +34,131 @@
   <arg name="box_max_y"/>
   <arg name="box_max_z"/>
 
+  <!--
+    统一输入接口：
+    - odometry_topic   : 机体状态，nav_msgs/Odometry
+    - sensor_pose_topic: 相机位姿，geometry_msgs/PoseStamped
+    - depth_topic      : 深度图，sensor_msgs/Image
+    - cloud_topic      : 点云，sensor_msgs/PointCloud2
+  -->
   <arg name="odometry_topic"/>
   <arg name="sensor_pose_topic"/>
   <arg name="depth_topic"/>
   <arg name="cloud_topic"/>
 
+  <!-- 深度相机内参，供 MapROS 做反投影。 -->
   <arg name="cx"/>
   <arg name="cy"/>
   <arg name="fx"/>
   <arg name="fy"/>
 
+  <!-- 统一动力学上限，会继续下传给 exploration / search / optimization 三层。 -->
   <arg name="max_vel"/>
   <arg name="max_acc"/>
 
-  <!-- main node -->
+  <!--
+    主算法节点。
+
+    对外的关键输入：
+    - /odom_world    : 当前 odom
+    - /map_ros/pose  : 相机位姿
+    - /map_ros/depth : 深度图
+    - /map_ros/cloud : 点云（与 depth 二选一）
+
+    对外的关键输出不在这里显式声明，但从代码可知主要有：
+    - /planning/bspline
+    - /planning/replan
+    - /planning/new
+    - /planning_vis/*
+  -->
   <node pkg="exploration_manager" name="exploration_node" type="exploration_node" output="screen">
+    <!--
+      exploration_node 内部统一把机体状态接口写成 /odom_world。
+      数据类型：nav_msgs/Odometry
+      用途：
+      - FSM 读取当前位置 / 速度 / yaw
+      - 规划时构造起始状态
+      - 执行中触发重规划
+    -->
     <remap from ="/odom_world" to="$(arg odometry_topic)"/>
+
+    <!--
+      相机位姿接口。
+      数据类型：geometry_msgs/PoseStamped
+      上游通常是 pcl_render_node 发布的 /pcl_render_node/sensor_pose。
+      MapROS 会把它与 depth/cloud 同步后更新地图。
+    -->
     <remap from ="/map_ros/pose"   to = "$(arg sensor_pose_topic)"/> 
+
+    <!--
+      深度输入接口。
+      数据类型：sensor_msgs/Image
+      默认 office demo 主要走这个分支，而不是直接用点云分支。
+    -->
     <remap from ="/map_ros/depth" to = "$(arg depth_topic)"/>
+
+    <!--
+      点云输入接口。
+      数据类型：sensor_msgs/PointCloud2
+      exploration_node 同时支持 depth 和 cloud 两种输入路径，但通常只用其中一种。
+    -->
     <remap from ="/map_ros/cloud" to="$(arg cloud_topic)"/>
 
+    <!-- ======================= -->
+    <!-- 1) 地图主体：SDFMap 参数 -->
+    <!-- ======================= -->
+
+    <!-- 体素分辨率与地图尺寸。 -->
     <param name="sdf_map/resolution"      value="0.1" /> 
     <param name="sdf_map/map_size_x"   value="$(arg map_size_x_)" /> 
     <param name="sdf_map/map_size_y"   value="$(arg map_size_y_)" /> 
     <param name="sdf_map/map_size_z"   value="$(arg map_size_z_)" /> 
-    <!-- <param name="sdf_map/obstacles_inflation"     value="0.099" />  -->
+
+    <!-- 膨胀半径：后续碰撞检测、frontier 视点采样、raycasting 都使用膨胀后的占据。 -->
     <param name="sdf_map/obstacles_inflation"     value="0.199" /> 
+
+    <!--
+      局部更新框控制：
+      - local_bound_inflate : 每帧点云融合后，把局部更新框向外再扩一圈
+      - local_map_margin    : 保留局部地图时的额外边界
+      这两项的核心作用是支持“增量更新”而不是每次全图刷新。
+    -->
     <param name="sdf_map/local_bound_inflate"    value="0.5"/>
     <param name="sdf_map/local_map_margin" value="50"/>
+
+    <!-- ground_height 定义地图原点 z；default_dist 是 ESDF 的默认初值。 -->
     <param name="sdf_map/ground_height"        value="-1.0"/>
     <param name="sdf_map/default_dist"        value="0.0"/>
     
+    <!--
+      占据栅格的 log-odds 融合参数。
+      p_hit / p_miss / p_min / p_max / p_occ 共同决定：
+      - 每次观测是如何更新 occupancy probability
+      - 何时把某个体素视为 occupied
+    -->
     <param name="sdf_map/p_hit"  value="0.65"/>
     <param name="sdf_map/p_miss" value="0.35"/>
     <param name="sdf_map/p_min"  value="0.12"/>
     <param name="sdf_map/p_max"  value="0.90"/>
     <param name="sdf_map/p_occ"  value="0.80"/>
+
+    <!-- 射线长度限制：建图与 frontier 可见性都受它影响。 -->
     <param name="sdf_map/min_ray_length" value="0.5"/>
     <param name="sdf_map/max_ray_length" value="4.5"/>
+
+    <!-- virtual_ceil_height 可用于添加虚拟天花板；此处 -10 基本等于关闭。 -->
     <param name="sdf_map/virtual_ceil_height"   value="-10"/>
+
+    <!--
+      optimistic=false:
+      unknown 不会被当作 free，从而更保守更安全。
+      signed_dist=false:
+      只维护普通 ESDF，不维护 signed distance。
+    -->
     <param name="sdf_map/optimistic" value="false" type="bool"/>
     <param name="sdf_map/signed_dist" value="false" type="bool"/>
+
+    <!-- 有效探索包围盒，供 frontier / 可视化 / 边界检查使用。 -->
     <param name="sdf_map/box_min_x" value="$(arg box_min_x)" type="double"/>
     <param name="sdf_map/box_min_y" value="$(arg box_min_y)" type="double"/>
     <param name="sdf_map/box_min_z" value="$(arg box_min_z)" type="double"/>
@@ -58,15 +166,27 @@
     <param name="sdf_map/box_max_y" value="$(arg box_max_y)" type="double"/>
     <param name="sdf_map/box_max_z" value="$(arg box_max_z)" type="double"/>
 
+    <!-- ======================= -->
+    <!-- 2) ROS 建图封装：MapROS 参数 -->
+    <!-- ======================= -->
+
+    <!-- 深度相机内参，供 depth -> point cloud 反投影。 -->
     <param name="map_ros/cx" value="$(arg cx)"/>
     <param name="map_ros/cy" value="$(arg cy)"/>
     <param name="map_ros/fx" value="$(arg fx)"/>
     <param name="map_ros/fy" value="$(arg fy)"/>
+
+    <!-- 深度图过滤参数：限制有效深度范围并跳采样。 -->
     <param name="map_ros/depth_filter_maxdist"   value="5.0"/>
     <param name="map_ros/depth_filter_mindist"   value="0.2"/>
     <param name="map_ros/depth_filter_margin"    value="2"/>
     <param name="map_ros/k_depth_scaling_factor" value="1000.0"/>
     <param name="map_ros/skip_pixel" value="2"/>
+
+    <!--
+      地图可视化与 ESDF 切片参数。
+      主要影响 RViz 显示与 ESDF 发布，不直接改变探索决策。
+    -->
     <param name="map_ros/esdf_slice_height" value="0.3"/>
     <param name="map_ros/visualization_truncate_height"   value="10.09"/>
     <param name="map_ros/visualization_truncate_low"   value="-2.0"/>
@@ -75,31 +195,76 @@
     <param name="map_ros/show_all_map" value="true"/>
     <param name="map_ros/frame_id"      value="world"/>
 
-    <!-- Fsm -->
+    <!-- =========================== -->
+    <!-- 3) 顶层行为控制：FSM 参数 -->
+    <!-- =========================== -->
+
+    <!--
+      三个重规划阈值，对应 FastExplorationFSM::EXEC_TRAJ 中的三类条件：
+      - thresh_replan1 : 轨迹快结束时重规划
+      - thresh_replan2 : 当前目标 frontier 已被覆盖时重规划
+      - thresh_replan3 : 周期性重规划
+    -->
     <param name="fsm/thresh_replan1" value="0.5" type="double"/>
     <param name="fsm/thresh_replan2" value="0.5" type="double"/>
     <param name="fsm/thresh_replan3" value="1.5" type="double"/>
 
-    <!-- <param name="fsm/thresh_replan1" value="0.00001" type="double"/> -->
-    <!-- <param name="fsm/thresh_replan2" value="100.0" type="double"/> -->
-    <!-- <param name="fsm/thresh_replan3" value="0.1" type="double"/> -->
+    <!--
+      replan_time：
+      动态重规划时，不是从“当前时刻”的旧轨迹状态开始接，而是从当前时间往后推一小段，
+      给 traj_server 和控制器留出切换余量。
+    -->
     <param name="fsm/replan_time" value="0.200" type="double"/>
 
-    <!-- Exploration manager -->
+    <!-- ================================================ -->
+    <!-- 4) 探索决策层：FastExplorationManager / FIS 参数 -->
+    <!-- ================================================ -->
 
+    <!--
+      局部 refinement 策略：
+      - refine_local   : 是否在全局 frontier tour 的前缀上做局部视点细化
+      - refined_num    : 最多细化多少个 frontier
+      - refined_radius : 只细化当前附近一段 frontier
+      - top_view_num   : 每个 frontier 最多保留多少个高质量 viewpoint
+      - max_decay      : 可见性衰减阈值，防止保留太多低质量视点
+    -->
     <param name="exploration/refine_local" value="true" type="bool"/>
     <param name="exploration/refined_num" value="7" type="int"/>
     <param name="exploration/refined_radius" value="5.0" type="double"/>
     <param name="exploration/max_decay" value="0.8" type="double"/>
     <param name="exploration/top_view_num" value="15" type="int"/>
+
+    <!--
+      ViewNode surrogate cost 中使用的运动学参数：
+      - vm / am        : 平移部分的速度 / 加速度尺度
+      - yd / ydd       : yaw 速度 / yaw 加速度尺度
+      - w_dir          : 速度方向不一致惩罚
+      它们主要用于：
+      - frontier 之间 cost matrix
+      - 全局 ATSP
+      - 局部 viewpoint refinement
+    -->
     <param name="exploration/vm" value="$(eval 1.0 * arg('max_vel'))" type="double"/>
     <param name="exploration/am" value="$(eval 1.0 * arg('max_acc'))" type="double"/>
     <param name="exploration/yd" value="$(eval 60 * 3.1415926 / 180.0)" type="double"/>
     <param name="exploration/ydd" value="$(eval 90 * 3.1415926 / 180.0)" type="double"/>
     <param name="exploration/w_dir" value="1.5" type="double"/>
+
+    <!-- LKH 的资源目录；findGlobalTour() 会在这里写 tsp/par/tour 文件。 -->
     <param name="exploration/tsp_dir" value="$(find lkh_tsp_solver)/resource" type="string"/>
+
+    <!-- yaw 末段 relax 时间，避免最后一小段 yaw 被过度 look-forward 约束。 -->
     <param name="exploration/relax_time" value="1.0" type="double"/>
 
+    <!--
+      frontier/FIS 参数：
+      - cluster_*              : frontier 聚类及大 cluster 切分阈值
+      - min_candidate_*        : 视点与当前位姿 / unknown / 障碍的距离要求
+      - candidate_*            : 环绕 frontier 平均位置采样视点时的半径和角度分辨率
+      - down_sample            : frontier 下采样倍率
+      - min_visib_num          : 一个视点至少要看见多少 frontier cells 才保留
+      - min_view_finish_fraction : 判断“当前 frontier 已覆盖 enough”时的比例阈值
+    -->
     <param name="frontier/cluster_min" value="100" type="int"/>
     <param name="frontier/cluster_size_xy" value="2.0" type="double"/>
     <param name="frontier/cluster_size_z" value="10.0" type="double"/>
@@ -113,14 +278,24 @@
     <param name="frontier/min_visib_num" value="15" type="int"/>;
     <param name="frontier/min_view_finish_fraction" value="0.2" type="double"/>;
 
-    <!-- Perception utils -->
+    <!--
+      视场模型参数。
+      被以下模块共同使用：
+      - FrontierFinder::countVisibleCells()：判断某个视点能看到多少 frontier
+      - traj_server                ：绘制当前 FoV 可视化
+    -->
     <param name="perception_utils/top_angle" value="0.56125" type="double"/>;
     <param name="perception_utils/left_angle" value="0.69222" type="double"/>;
     <param name="perception_utils/right_angle" value="0.68901" type="double"/>;
     <param name="perception_utils/max_dist" value="4.5" type="double"/>;
     <param name="perception_utils/vis_dist" value="1.0" type="double"/>;
 
-
+    <!--
+      yaw / heading 规划参数。
+      主要用于 planner_manager 中的 heading planner / yaw 优化。
+      对单机探索主线来说，真正最常用的是 planYawExplore()，
+      但这一组参数仍属于“朝向规划层”的统一配置。
+    -->
     <param name="heading_planner/yaw_diff" value="$(eval 30 * 3.1415926 / 180.0)" type="double"/>
     <param name="heading_planner/half_vert_num" value="5" type="int"/>
     <param name="heading_planner/lambda1" value="2.0" type="double"/>
@@ -129,8 +304,19 @@
     <param name="heading_planner/w" value="20000.0" type="double"/>
     <param name="heading_planner/weight_type" value="1" type="double"/>
 
-  <!-- planner manager -->
-    <!-- <param name="manager/max_vel" value="$(arg max_vel)" type="double"/> -->
+    <!-- ============================================== -->
+    <!-- 5) 规划管理层：FastPlannerManager 总开关与约束 -->
+    <!-- ============================================== -->
+
+    <!--
+      manager/* 决定 planner manager 内部哪些模块打开：
+      - use_geometric_path    : 普通 A*
+      - use_kinodynamic_path  : kino A*
+      - use_topo_path         : topo PRM
+      - use_optimization      : B-spline 优化
+      - use_active_perception : frontier / heading planner
+      - min_time              : 是否打开最短时间项
+    -->
     <param name="manager/max_vel" value="$(arg max_vel)" type="double"/>
     <param name="manager/max_acc" value="$(arg max_acc)" type="double"/>
     <param name="manager/max_jerk" value="4" type="double"/>
@@ -145,7 +331,14 @@
     <param name="manager/use_active_perception" value="true" type="bool"/>
     <param name="manager/min_time" value="true" type="bool"/>
 
-  <!-- kinodynamic path searching -->
+    <!-- ====================================== -->
+    <!-- 6) kinodynamic A* 与普通 A* 搜索参数 -->
+    <!-- ====================================== -->
+
+    <!--
+      kino A* 主要在“中等距离且需要精确打到 next viewpoint”时使用。
+      这些参数控制状态扩展步长、时间分辨率、启发式权重和搜索预算。
+    -->
     <param name="search/max_tau" value="0.8" type="double"/>
     <param name="search/init_max_tau" value="1.0" type="double"/>
     <param name="search/max_vel" value="$(arg max_vel)" type="double"/>
@@ -161,12 +354,34 @@
     <param name="search/check_num" value="10" type="int"/>
     <param name="search/optimistic" value="false" type="bool"/>
 
+    <!--
+      普通 A* 参数。
+      在 FUEL 主线里主要用于：
+      - 几何路径初始化
+      - frontier 之间 coarse path/cost 估计
+      - ViewNode::searchPath()
+    -->
     <param name="astar/lambda_heu" value="10000.0" type="double"/>
     <param name="astar/resolution_astar" value="0.2" type="double"/>
     <param name="astar/allocate_num" value="1000000" type="int"/>
     <param name="astar/max_search_time" value="0.001" type="double"/>
 
-  <!-- trajectory optimization -->
+    <!-- ===================================== -->
+    <!-- 7) B-spline 轨迹优化与可行性参数 -->
+    <!-- ===================================== -->
+
+    <!--
+      optimization/* 是 B-spline 代价项权重与求解器配置。
+      常见含义：
+      - ld_smooth : 平滑项
+      - ld_dist   : 障碍距离项
+      - ld_feasi  : 动力学可行性项
+      - ld_start / ld_end : 起止状态约束
+      - ld_guide  : 引导路径项
+      - ld_waypt  : waypoint 约束项
+      - ld_view   : 视点相关项（本 demo 里通常为 0）
+      - ld_time   : 最短时间项
+    -->
     <param name="optimization/ld_smooth" value="20.0" type="double"/>
     <param name="optimization/ld_dist" value="10.0" type="double"/>
     <param name="optimization/ld_feasi" value="2.0" type="double"/>
@@ -186,10 +401,17 @@
     <param name="optimization/max_iteration_num3" value="200" type="int"/>
     <param name="optimization/max_iteration_num4" value="200" type="int"/>
 
+    <!-- 单阶段优化的时间预算；值越大越可能出更好轨迹，但规划延迟也会上升。 -->
     <param name="optimization/max_iteration_time1" value="0.0001" type="double"/>
     <param name="optimization/max_iteration_time2" value="0.005" type="double"/>
     <param name="optimization/max_iteration_time3" value="0.003" type="double"/>
     <param name="optimization/max_iteration_time4" value="0.003" type="double"/>
+
+    <!--
+      B-spline 可行性约束：
+      - limit_vel / limit_acc : 轨迹速度加速度限制
+      - limit_ratio           : 允许的时间重分配比例
+    -->
     <param name="bspline/limit_vel" value="$(arg max_vel)" type="double"/>
     <param name="bspline/limit_acc" value="$(arg max_acc)" type="double"/>
     <param name="bspline/limit_ratio" value="1.1" type="double"/>
