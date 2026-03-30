@@ -1,29 +1,93 @@
 <launch>
+  <!--
+    单机探索 demo 的仿真与执行栈。
+
+    这个 launch 主要负责 4 件事：
+    1. 发布静态环境点云：office.pcd -> /map_generator/global_cloud
+    2. 执行控制闭环：/planning/pos_cmd -> so3_control -> so3_cmd -> quadrotor_simulator_so3
+    3. 生成“带误差的状态估计”：/visual_slam/odom -> /state_ukf/odom
+    4. 渲染机载深度传感器：全局地图 + 当前位姿 -> /pcl_render_node/depth + /pcl_render_node/sensor_pose
+
+    和 FUEL 算法本体真正对接的关键接口有两组：
+    1. 控制执行接口
+       /planning/pos_cmd                     : quadrotor_msgs/PositionCommand
+       -> so3_control
+       -> so3_cmd                           : quadrotor_msgs/SO3Command
+       -> quadrotor_simulator_so3
+
+    2. 感知建图接口
+       /map_generator/global_cloud          : sensor_msgs/PointCloud2
+       + $(arg odometry_topic)              : nav_msgs/Odometry
+       -> pcl_render_node
+       -> /pcl_render_node/depth            : sensor_msgs/Image
+       -> /pcl_render_node/sensor_pose      : geometry_msgs/PoseStamped
+
+    之后 exploration.launch 会把上面两条传感器输出接到 exploration_node / MapROS，
+    也就是再映射成算法侧使用的 depth_topic / sensor_pose_topic。
+  -->
+
+  <!-- 无人机初始位置，供动力学仿真器设置初始状态。 -->
   <arg name="init_x"/>
   <arg name="init_y"/>
-  <arg name="init_z"/> 
+  <arg name="init_z"/>
+
+  <!-- 地图尺寸，主要供 local_sensing 的渲染边界与随机地图生成器使用。 -->
   <arg name="map_size_x_"/>
   <arg name="map_size_y_"/>
   <arg name="map_size_z_"/>
+
+  <!--
+    以下 box 参数在当前 office.pcd 这条仿真路径里基本不直接使用，
+    主要是为了和另一套随机地图 / 包围盒配置接口保持兼容。
+  -->
   <arg name="box_min_x"/>
   <arg name="box_min_y"/>
   <arg name="box_min_z"/>
   <arg name="box_max_x"/>
   <arg name="box_max_y"/>
   <arg name="box_max_z"/>
+
+  <!--
+    兼容保留参数：
+    - c_num / p_num / obj_num 主要对旧的随机障碍物生成逻辑有意义
+    - 当前 office.pcd 静态地图模式下基本不会真正用到
+  -->
   <arg name="c_num"/>
   <arg name="p_num"/>
+
+  <!--
+    传感器仿真所使用的统一机体状态输入。
+    在 exploration.launch 里通常传入 /state_ukf/odom。
+    这条 odom 会被 local_sensing 当作“相机所在机体位姿”来渲染深度图。
+  -->
   <arg name="odometry_topic"/>
   <arg name="obj_num" value="1" />
 
-  <!-- map generation 1-->
-  <!-- Change office.pcd to specify the exploration environment -->
-  <!-- We provide office2.pcd, office3.pcd and pillar.pcd in this repo -->
-  <node pkg ="map_generator" name ="map_pub" type ="map_pub" output = "screen" args="$(find map_generator)/resource/office.pcd"/>    
+  <!--
+    方案 A：直接加载离线点云地图。
 
-  <!-- map generation 2-->
-  <!-- <node pkg ="map_generator" name ="random_forest" type ="random_forest" output = "screen">    
-    <remap from="~odometry"   to="$(arg odometry_topic)"/>    
+    节点：map_pub
+    作用：读取 PCD 文件并持续发布全局环境点云。
+    输出接口：
+    - /map_generator/global_cloud : sensor_msgs/PointCloud2
+      下游消费者：pcl_render_node 的 ~global_map
+
+    这里默认使用 office.pcd，你也可以换成：
+    - office2.pcd
+    - office3.pcd
+    - pillar.pcd
+  -->
+  <node pkg ="map_generator" name ="map_pub" type ="map_pub" output = "screen" args="$(find map_generator)/resource/office.pcd"/>
+
+  <!--
+    方案 B：程序化随机地图生成。
+    当前默认关闭，保留作旧 demo / 对比实验用。
+
+    如果启用，它会根据 odom 和尺寸参数在线生成障碍物地图，
+    替代上面的 office.pcd 静态环境。
+  -->
+  <!-- <node pkg ="map_generator" name ="random_forest" type ="random_forest" output = "screen">
+    <remap from="~odometry"   to="$(arg odometry_topic)"/>
     <param name="init_state_x"   value="$(arg init_x)"/>
     <param name="init_state_y"   value="$(arg init_y)"/>
     <param name="map/x_size"     value="$(arg map_size_x_)" />
@@ -49,26 +113,67 @@
     <param name="sensing/rate"   value="10.0"/>        
   </node> -->
 
-  <!-- <node pkg ="traj_utils" name ="process_msg" type ="process_msg" output = "screen">    
+  <!-- <node pkg ="traj_utils" name ="process_msg" type ="process_msg" output = "screen">
   </node> -->
 
+  <!--
+    动力学仿真器。
+
+    节点：quadrotor_simulator_so3
+    作用：接收控制器输出的 SO3 命令，积分四旋翼动力学，发布“真值 odom”。
+
+    关键接口：
+    - 输入 so3_cmd : quadrotor_msgs/SO3Command
+      来源：so3_control
+    - 输出 /visual_slam/odom : nav_msgs/Odometry
+      含义：这里可视为仿真中的真值位姿，后续会再被 disturbance_generator 加噪
+    - 输入 force_disturbance / moment_disturbance : geometry_msgs/Vector3
+      来源：so3_disturbance_generator，用于模拟外力和外力矩扰动
+  -->
   <node pkg="so3_quadrotor_simulator" type="quadrotor_simulator_so3" name="quadrotor_simulator_so3" output="screen">
+        <!-- odom 真值输出，供可视化和扰动模块使用。 -->
         <param name="rate/odom" value="200.0"/>
         <param name="simulator/init_state_x" value="$(arg init_x)"/>
         <param name="simulator/init_state_y" value="$(arg init_y)"/>
         <param name="simulator/init_state_z" value="$(arg init_z)"/>
 
+        <!-- ~odom 在源码中是 nav_msgs/Odometry 发布口，这里统一命名为 /visual_slam/odom。 -->
         <remap from="~odom" to="/visual_slam/odom"/>
+        <!-- ~cmd 在源码中订阅 quadrotor_msgs/SO3Command，这里接控制器输出。 -->
         <remap from="~cmd" to="so3_cmd"/>
-        <remap from="~force_disturbance" to="force_disturbance"/>    
-        <remap from="~moment_disturbance" to="moment_disturbance"/>        
+        <!-- 扰动输入，供仿真器叠加外力和外力矩。 -->
+        <remap from="~force_disturbance" to="force_disturbance"/>
+        <remap from="~moment_disturbance" to="moment_disturbance"/>
   </node>
- 
+
+  <!--
+    SO3 控制器。
+
+    节点：so3_control
+    作用：把 planner 给出的期望位置命令转换成姿态 / 推力控制命令。
+    它是“规划输出”和“动力学仿真”之间的边界。
+
+    关键接口：
+    - 输入 /planning/pos_cmd : quadrotor_msgs/PositionCommand
+      来源：traj_server
+    - 输入 /state_ukf/odom : nav_msgs/Odometry
+      来源：so3_disturbance_generator，作为控制器使用的状态估计
+    - 输出 so3_cmd : quadrotor_msgs/SO3Command
+      下游：quadrotor_simulator_so3
+
+    另外还有两个辅助接口：
+    - motors      : std_msgs/Bool，电机开关
+    - corrections : quadrotor_msgs/Corrections，控制修正量
+    当前探索 demo 里它们不是主线接口，但保留了完整控制链。
+  -->
   <node pkg="nodelet" type="nodelet" args="standalone so3_control/SO3ControlNodelet" name="so3_control" required="true" output="screen">
+        <!-- 控制器使用的状态估计输入，不是仿真真值，而是加噪后的 /state_ukf/odom。 -->
         <remap from="~odom" to="/state_ukf/odom"/>
+        <!-- 规划器执行输出接口：traj_server 按时间采样 B-spline 后发布到这里。 -->
         <remap from="~position_cmd" to="/planning/pos_cmd"/>
         <remap from="~motors" to="motors"/>
         <remap from="~corrections" to="corrections"/>
+        <!-- 控制器最终输出给动力学仿真器的 SO3 命令。 -->
         <remap from="~so3_cmd" to="so3_cmd"/>
         <rosparam file="$(find so3_control)/config/gains_hummingbird.yaml"/>
         <rosparam file="$(find so3_control)/config/corrections_hummingbird.yaml"/>
@@ -77,16 +182,37 @@
         <param name="use_external_yaw "      value="false"/>
         <param name="gains/rot/z" value="1.0"/>    
         <param name="gains/ang/z" value="0.1"/>        
-  </node>  
- 
+  </node>
+
+  <!--
+    扰动与“假状态估计”生成器。
+
+    节点：so3_disturbance_generator
+    作用：
+    1. 读取 /visual_slam/odom 真值
+    2. 生成带噪声 / 带误差的 /state_ukf/odom
+    3. 同时发布外力、外力矩和 correction，供控制链模拟更真实的估计误差
+
+    关键接口：
+    - 输入 /visual_slam/odom           : nav_msgs/Odometry
+    - 输出 /state_ukf/odom             : nav_msgs/Odometry
+      这通常会被 exploration.launch 当成系统统一 odom，再映射为 /odom_world
+    - 输出 /visual_slam/correction     : geometry_msgs/PoseStamped
+    - 输出 force_disturbance           : geometry_msgs/Vector3
+    - 输出 moment_disturbance          : geometry_msgs/Vector3
+  -->
   <node pkg="so3_disturbance_generator" name="so3_disturbance_generator" type="so3_disturbance_generator" output="screen">
-        <remap from="~odom" to="/visual_slam/odom"/>             
-        <remap from="~noisy_odom" to="/state_ukf/odom"/>          
-        <remap from="~correction" to="/visual_slam/correction"/>   
-        <remap from="~force_disturbance" to="force_disturbance"/>        
-        <remap from="~moment_disturbance" to="moment_disturbance"/>            
-  </node> 
- 
+        <remap from="~odom" to="/visual_slam/odom"/>
+        <remap from="~noisy_odom" to="/state_ukf/odom"/>
+        <remap from="~correction" to="/visual_slam/correction"/>
+        <remap from="~force_disturbance" to="force_disturbance"/>
+        <remap from="~moment_disturbance" to="moment_disturbance"/>
+  </node>
+
+  <!--
+    仅用于 RViz 显示 odom 轨迹和机体模型。
+    不参与 FUEL 的建图、frontier 或规划逻辑。
+  -->
   <node pkg="odom_visualization" name="odom_visualization" type="odom_visualization" output="screen">
         <remap from="~odom" to="/visual_slam/odom"/>
         <param name="color/a" value="1.0"/>    
@@ -97,17 +223,46 @@
         <param name="robot_scale" value="1.0"/>
   </node>
 
+  <!--
+    机载深度传感器仿真。
+
+    节点：pcl_render_node
+    作用：把“全局静态点云地图 + 当前机体 odom”渲染成当前视角深度图，
+    相当于在仿真里提供一个深度相机。
+
+    输入接口：
+    - ~global_map -> /map_generator/global_cloud : sensor_msgs/PointCloud2
+      来源：map_pub
+    - ~odometry   -> $(arg odometry_topic)       : nav_msgs/Odometry
+      来源：通常是 /state_ukf/odom
+
+    重要输出接口（这些名字在源码里是直接 advertise 出来的）：
+    - /pcl_render_node/depth        : sensor_msgs/Image
+    - /pcl_render_node/sensor_pose  : geometry_msgs/PoseStamped
+    - rendered_pcl                  : sensor_msgs/PointCloud2，仅调试用
+    - camera_info                   : sensor_msgs/CameraInfo
+
+    对 FUEL 最关键的是前两个输出：
+    它们会在 exploration.launch 中作为 depth_topic 和 sensor_pose_topic，
+    进入 MapROS，再被融合成 occupancy / ESDF。
+  -->
   <node pkg="local_sensing_node" type="pcl_render_node" name="pcl_render_node" output="screen">
+        <!-- 相机内参与外参配置。 -->
         <rosparam command="load" file="$(find local_sensing_node)/params/camera.yaml" />
+
+        <!-- 渲染视距、感知频率、位姿发布频率。 -->
         <param name="sensing_horizon"  value="5.0" />
         <param name="sensing_rate"     value="15.0"/>
         <param name="estimation_rate"  value="15.0"/>
 
+        <!-- local_sensing 内部用于限制渲染空间边界。 -->
         <param name="map/x_size"     value="$(arg map_size_x_)"/>
         <param name="map/y_size"     value="$(arg map_size_y_)"/>
         <param name="map/z_size"     value="$(arg map_size_z_)"/>
 
+        <!-- 上游环境点云输入。 -->
         <remap from="~global_map" to="/map_generator/global_cloud"/>
+        <!-- 上游机体状态输入，决定当前相机视角。 -->
         <remap from="~odometry"   to="$(arg odometry_topic)"/>
   </node>
 

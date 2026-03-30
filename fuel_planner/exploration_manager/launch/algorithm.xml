@@ -117,10 +117,22 @@
     <param name="sdf_map/obstacles_inflation"     value="0.199" /> 
 
     <!--
-      局部更新框控制：
-      - local_bound_inflate : 每帧点云融合后，把局部更新框向外再扩一圈
-      - local_map_margin    : 保留局部地图时的额外边界
-      这两项的核心作用是支持“增量更新”而不是每次全图刷新。
+      局部处理窗口相关参数。
+
+      local_bound_inflate：
+      - 当前真正生效的核心参数，单位是米
+      - 每帧点云融合后，会先得到这帧观测覆盖到的 update box
+      - 再把这个 update box 在 x/y 方向向外扩 local_bound_inflate
+      - 扩出来的 local_bound_min/max 会被后续用于：
+        1) 局部重建 inflated occupancy
+        2) 局部更新 ESDF
+      - 它的作用是：保证局部边界附近的膨胀和距离场也算完整，而不是只算到观测刚好结束的位置
+
+      local_map_margin：
+      - 单位是体素数，不是米
+      - 在当前 exploration 主线里不是核心参数
+      - 主要出现在 ESDF 可视化范围和一些已经注释掉的旧局部地图裁剪逻辑里
+      - 所以它更像历史遗留 / 调试边界参数，而不是当前增量更新的关键开关
     -->
     <param name="sdf_map/local_bound_inflate"    value="0.5"/>
     <param name="sdf_map/local_map_margin" value="50"/>
